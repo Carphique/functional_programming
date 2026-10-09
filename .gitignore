@@ -16,3 +16,12 @@ project/project/
 
 # Temporary files
 tmp/
+
+target/
+.bsp/
+.metals/
+.bloop/
+.vscode/
+.idea/
+project/target/
+project/project/
