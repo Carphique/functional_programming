@@ -3,13 +3,23 @@ package runner.bots
 import runner.*
 
 /**
- * Ансамблевий автопілот, який ухвалює рішення за мажоритарним правилом (Majority Voting).
- *
- * Опитує трьох ботів (GreedyBot, ReflexBot, StrategicBot).
- * Якщо хоча б 2 боти проголосували за одну й ту саму дію — обирається вона.
- * Якщо голоси розділилися порівну (1:1:1) — обирається пріоритетна дія першого бота.
+ * Ансамблевий автопілот MISD із захисним арбітражем (Safety Veto),
+ * безпечним розв'язанням нічиєї (1:1:1) та адаптацією до Backpressure.
  */
 class MajorityBot(val bots: List[CyberBot]) extends CyberBot:
+
+  private val strategicGuard = new StrategicBot()
+  private val reflexFast     = new ReflexBot()
+
+  // Попередній прогрів JIT-компілятора JVM до початку відліку таймера Engine
+  private val warmupObs = Observation(
+    HeroState(),
+    List(TunnelSlice.empty, TunnelSlice.empty, TunnelSlice.empty, TunnelSlice.empty, TunnelSlice.empty),
+    100_000_000L
+  )
+  bots.foreach(b => (1 to 300).foreach(_ => b.decide(warmupObs)))
+  (1 to 300).foreach(_ => reflexFast.decide(warmupObs))
+  (1 to 300).foreach(_ => strategicGuard.isTrajectorySafe(warmupObs, Action.KeepRunning))
 
   def this(seed: Long = 2026L) = this(List(
     new GreedyBot(seed + 101L),
@@ -20,17 +30,55 @@ class MajorityBot(val bots: List[CyberBot]) extends CyberBot:
   override def name: String = "MajorityEnsembleBot"
 
   override def decide(observation: Observation): Action =
-    val votes = bots.map(_.decide(observation))
+    observation.upcoming match
+      case Nil =>
+        Action.KeepRunning
+      case nextSlice :: _ =>
+        val currentLane = observation.hero.lane
 
-    // Підрахунок голосів
-    val grouped = votes.groupBy(identity).view.mapValues(_.size).toMap
+        // Адаптація до Backpressure: при падінні бюджету часу нижче 5 мс
+        // перемикаємося на Zero-GC O(1) рефлекс без алокацій, щоб уникнути GC і таймаутів
+        if observation.timeBudgetNanos < 5_000_000L then
+          reflexFast.decide(observation)
+        else
+          // 1. Опитуємо тріаду MISD (один Observation -> три незалежні алгоритми)
+          val labelledVotes: List[(CyberBot, Action)] =
+            bots.map(bot => bot -> bot.decide(observation))
 
-    // Знаходимо дію з максимальною кількістю голосів
-    val (winnerAction, maxVotes) = grouped.maxBy(_._2)
+          // 2. Safety Veto ДО підрахунку голосів:
+          // спершу відсіюємо смертельні дії на найближчому зрізі t+1
+          val immediateSafeVotes: List[(CyberBot, Action)] =
+            labelledVotes.filter { case (_, action) =>
+              TunnelPhysics.isActionSafeOnSlice(nextSlice, currentLane, action)
+            }
 
-    if maxVotes >= 2 then
-      // Мажоритарна перемога (2:1 або 3:0)
-      winnerAction
-    else
-      // Нічия (1:1:1) — обираємо голос першого бота
-      votes.headOption.getOrElse(Action.KeepRunning)
+          // Додатково відсіюємо дії, які ведуть у зв'язану пастку на горизонті (якщо є вихід)
+          val trajectorySafeVotes = immediateSafeVotes.filter { case (_, action) =>
+            strategicGuard.isTrajectorySafe(observation, action)
+          }
+
+          val safeVotes =
+            if trajectorySafeVotes.nonEmpty then trajectorySafeVotes
+            else immediateSafeVotes
+
+          if safeVotes.isEmpty then
+            reflexFast.decide(observation)
+          else
+            // 3. Підрахунок голосів серед безпечних кандидатів
+            val counts: Map[Action, Int] =
+              safeVotes.map(_._2).groupBy(identity).view.mapValues(_.size).toMap
+
+            val (winnerAction, maxVotes) = counts.maxBy(_._2)
+
+            if maxVotes >= 2 then
+              winnerAction
+            else
+              // 4. Безпечний тай-брейк при нічиї 1:1:1:
+              // пріоритет має StrategicBot або ReflexBot, а НЕ GreedyBot
+              val strategicVote = safeVotes.collectFirst { case (_: StrategicBot, act) => act }
+              val reflexVote    = safeVotes.collectFirst { case (_: ReflexBot, act)    => act }
+
+              strategicVote
+                .orElse(reflexVote)
+                .orElse(safeVotes.headOption.map(_._2))
+                .getOrElse(Action.KeepRunning)
